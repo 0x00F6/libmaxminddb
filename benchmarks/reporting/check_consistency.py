@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Cross-check that every deliverable reports the numbers in summary.json."""
+import argparse
 import html
 import json
 import re
@@ -24,8 +25,12 @@ def check(name, ok, detail=''):
 
 
 def main():
+    global REPORTS
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reports', default=str(REPORTS), help='directory holding the generated reports')
+    REPORTS = Path(parser.parse_args().reports)
     summary = json.loads((REPORTS / 'performance-comparison-data/summary.json').read_text())
-    report.SIZE = report.workload_size(summary)
+    report.configure(summary)
     ctx = report.Context(summary)
     pr = (REPORTS / 'pull-request-description.md').read_text()
     page = (REPORTS / 'performance-comparison.html').read_text()
@@ -91,6 +96,10 @@ def main():
         text = html.unescape(re.sub(r'<[^>]+>', ' ', svg))
         ok = (cpu in text and f'Before · {ctx.before_short}' in text and f'After · {ctx.after_short}' in text
               and ('Higher is better' in text or 'Lower is better' in text))
+        if item['kind'] == 'diagram':
+            # The radix-16 diagram has no axes or legend; it shows the campaign's database and CPU.
+            ok = (cpu in text and f'{ctx.databases["city"]["node_count"]:,} nodes' in text
+                  and f'Before {ctx.before_short}' in text and f'After {ctx.after_short}' in text)
         if item['kind'] == 'candlestick':
             ok = ok and 'Lower whisker: min → p50' in text and 'max ' in text
         check(f'{item["id"]}.svg labels, legend and CPU', ok)

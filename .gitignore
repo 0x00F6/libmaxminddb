@@ -50,5 +50,7 @@ build/
 
 # Benchmark outputs: builds, measurements, databases and generated reports
 /benchmarks/artifacts/
+# GeoLite2-City cannot be redistributed.
+/benchmarks/GeoLite2-City.mmdb
 /benchmarks/reports/
 /benchmarks/**/__pycache__/

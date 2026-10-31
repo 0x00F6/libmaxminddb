@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Build isolated Before/After source snapshots, identical Release libraries and
-# the benchmark executables for campaign 3. Existing outputs are never
-# overwritten: choose another WORK directory to rebuild from scratch.
+# the benchmark executables. Existing outputs are never overwritten: choose
+# another WORK directory to rebuild from scratch.
 
 set -eu -o pipefail
 
@@ -13,7 +13,7 @@ BEFORE_SHA=${BEFORE_SHA:-88ad5f46d9c884fc4a8533374b457cb9e3ee121f}
 # same source tree as fd08b22; both give byte-identical libraries and executables.
 AFTER_SHA=${AFTER_SHA:-fd08b229052ae34e9f2c3c3df4f64ed9d43f4347}
 CC=${CC:-gcc}
-JOBS=${JOBS:-8}
+JOBS=${JOBS:-$(nproc)}
 BENCH_SOURCE=$REPO/benchmarks/harness/bench.c
 # Equivalent settings for both revisions: CMake's GCC Release flags.
 HARNESS_FLAGS=(-std=c11 -O3 -DNDEBUG -Wall -Wextra -Werror -pthread)
@@ -89,8 +89,8 @@ build_bench() {
 snapshot before "$BEFORE_SHA"
 snapshot after "$AFTER_SHA"
 
-# Record the main working tree at build time. Only .gitignore/.precious.toml
-# were modified there; they do not affect the library and are not applied.
+# Record the main working tree at build time. Local modifications are recorded,
+# never applied: the snapshots come from the commits alone.
 git -C "$REPO" rev-parse HEAD >"$PROVENANCE/head.txt"
 git -C "$REPO" status --porcelain=v1 >"$PROVENANCE/working-tree-status.txt"
 git -C "$REPO" diff HEAD >"$PROVENANCE/working-tree.diff"
@@ -100,6 +100,9 @@ git -C "$REPO" diff --stat "$BEFORE_SHA" "$AFTER_SHA" \
     >"$PROVENANCE/diffstat.txt"
 git -C "$REPO" diff "$BEFORE_SHA" "$AFTER_SHA" \
     >"$PROVENANCE/before-after.diff"
+# The harness and runner as they were for this campaign.
+cp "$BENCH_SOURCE" "$PROVENANCE/bench.c"
+cp "$REPO/benchmarks/campaign/run.py" "$PROVENANCE/run.py"
 
 for name in before after; do
     build_library "$name"

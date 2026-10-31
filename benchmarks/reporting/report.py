@@ -11,11 +11,13 @@ import datetime
 import hashlib
 import html
 import json
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import charts as C  # noqa: E402
+import diagram  # noqa: E402
 from charts import (fmt_mib, fmt_mlps, fmt_ms, fmt_ns, fmt_pct, fmt_speedup, THEME)  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +46,7 @@ class SizeLabels(dict):
 
 
 SIZE_LABEL = SizeLabels()
+# Worker counts of the campaign; configure() reads them from the data.
 THREADS = (1, 4, 8)
 FAMILIES = (4, 6)
 DATABASES = ('city', 'synthetic')
@@ -75,6 +78,15 @@ def present(configs, key, order):
     return [v for v in order if v in found]
 
 
+ARCH_LABEL = {'x86_64': 'x86-64', 'aarch64': 'AArch64'}
+CLOCK_LABEL = {'tsc': 'TSC-backed clock', 'arch_sys_counter': 'Arm generic timer',
+               'hyperv_clocksource_tsc_page': 'Hyper-V TSC-page clock'}
+
+
+def plural(count, word):
+    return f'{count} {word}{"s" if count != 1 else ""}'
+
+
 def fmt_hits(ratio):
     percent = ratio * 100
     if 0 < percent < 1:
@@ -83,8 +95,11 @@ def fmt_hits(ratio):
 
 
 class Context:
-    def __init__(self, summary):
+    def __init__(self, summary, key=None, prefix=''):
         self.s = summary
+        # Architecture key and the path of its directory, in a merged report.
+        self.key = key or summary['environment']['os']['architecture']
+        self.prefix = prefix
         env = summary['environment']
         self.cpu = env['cpu']['model']
         self.cores = env['cpu']['physical_cores']
@@ -110,6 +125,32 @@ class Context:
         self.memory_iterations = max(m['before']['iterations'] for m in summary['memory'])
         self.opens = {cold: max(r['open_ms']['n'] for r in summary['startup'] if r['cold'] == cold)
                       for cold in (False, True)}
+        cpu = env['cpu']
+        self.arch = ARCH_LABEL.get(env['os']['architecture'], env['os']['architecture'])
+        self.smt = cpu.get('smt_active') == '1' or (cpu.get('threads_per_core') or 1) > 1
+        self.ci = env.get('ci')
+        self.virtualization = env['os'].get('virtualization') or 'unknown'
+        self.governor = (cpu['topology'][0] if cpu.get('topology') else {}).get('governor')
+        # Distinct ACPI CPPC ranks: workers then start on the highest-ranked core.
+        self.ranked = len({c.get('cppc_highest_perf') for c in cpu.get('topology') or []} - {None}) > 1
+        # Core cycles come from AMD RDPRU (APERF); other CPUs have no user-space cycle counter.
+        self.cycles = any(c[v].get('core_cycles_per_lookup') for c in summary['throughput'] for v in ('before', 'after'))
+        self.max_threads = max(THREADS)
+        self.timer_step = (summary['protocol'].get('timer_granularity') or {}).get('step_ns')
+
+    def host(self):
+        """The kind of machine that ran the campaign."""
+        if self.ci:
+            return 'GitHub-hosted runner'
+        if self.virtualization not in ('none', 'unknown'):
+            return f'{self.virtualization} virtual machine'
+        return 'shared desktop'
+
+    def busiest(self):
+        """Which cores the runs with the most workers occupy."""
+        cores = self.cores
+        return (f'all {cores} physical cores' if self.max_threads >= cores
+                else f'{self.max_threads} of the {cores} physical cores')
 
     def select(self, campaign, **filters):
         return [c for c in self.s[campaign] if all(c[k] == v for k, v in filters.items())]
@@ -146,7 +187,8 @@ class Context:
         return f'Synthetic mixed fixture (generate_synthetic_database.py) · {nodes}'
 
     def cpu_line(self):
-        return (f'CPU: {self.cpu} · {self.cores} cores / {self.logical} threads (SMT on) · '
+        host = f' · {self.host()}' if self.host() != 'shared desktop' else ''
+        return (f'CPU: {self.cpu} · {self.cores} cores / {self.logical} threads ({"SMT on" if self.smt else "no SMT"}){host} · '
                 f'workers pinned to distinct physical cores · {self.os} · Linux {self.kernel} · GCC {self.gcc} -O3')
 
     def data_line(self, db):
@@ -172,7 +214,8 @@ def build_throughput(ctx, db, profile, op, family, size, standalone):
     subtitle = (f'{DB_LABEL[db]} · {PROFILE_TEXT[profile]} ({fmt_hits(configs[0]["hit_ratio"])} hits) · '
                 f'{ctx.operation_text(db, op)} · {size:,} queries total')
     footer = [f'Bars: median of {ctx.reps} repetitions · error bars: 95% bootstrap CI of the median · '
-              'speedup = After median / Before median · fixed total work split across 1, 4, 8 workers',
+              'speedup = After median / Before median · fixed total work split across '
+              f'{", ".join(str(t) for t in THREADS)} workers',
               ctx.cpu_line(), ctx.data_line(db)]
     return C.throughput_chart(ctx.meta(standalone), configs, throughput_title(family, profile, op, size),
                               subtitle, footer)
@@ -186,7 +229,8 @@ def build_candlestick(ctx, db, profile, op, family, size, standalone):
     subtitle = (f'{DB_LABEL[db]} · {PROFILE_TEXT[profile]} ({fmt_hits(configs[0]["hit_ratio"])} hits) · '
                 f'{ctx.operation_text(db, op)} · {size:,} queries total')
     timer = ctx.s['protocol']['timer_ns']
-    footer = [f'Every {stride}th lookup timed with CLOCK_MONOTONIC_RAW (≈10 ns clock steps on this CPU; timer pair ≈{timer["p50"]} ns, '
+    steps = f'≈{ctx.timer_step} ns clock steps on this CPU; ' if ctx.timer_step else ''
+    footer = [f'Every {stride}th lookup timed with CLOCK_MONOTONIC_RAW ({steps}timer pair ≈{timer["p50"]} ns, '
               f'included) · {ctx.reps} repetitions pooled, workers merged before percentiles · {obs:,} samples per bar',
               ctx.cpu_line(), ctx.data_line(db)]
     title = candlestick_title(family, op) + f' ({SIZE_LABEL[size]})'
@@ -201,9 +245,11 @@ def build_scaling(ctx, db, profile, op, standalone):
         panels.append({'title': f'IPv{family} · {SIZE_LABEL[SIZE]} queries', 'configs': configs})
     title = f'Thread Scaling — {PROFILE_TITLE[profile]} {OP_TITLE[op]}'
     subtitle = (f'{DB_LABEL[db]} · throughput(N) / throughput(1) of the same version · '
-                'labels: scaling at 8 workers · parallel efficiency')
+                f'labels: scaling at {ctx.max_threads} workers · parallel efficiency')
+    background = {'shared desktop': 'desktop background work',
+                  'GitHub-hosted runner': 'other work on the runner and its physical host'}.get(ctx.host(), 'other work on the host')
     footer = [f'Medians of {ctx.reps} repetitions · fixed total work · higher is better · '
-              'the 8-worker runs use all 8 physical cores, so desktop background work competes with them']
+              f'the {ctx.max_threads}-worker runs use {ctx.busiest()}, so {background} competes with them']
     note = scaling_note(ctx, db, profile, op)
     if note:
         footer.append(note)
@@ -217,6 +263,8 @@ def scaling_note(ctx, db, profile, op):
     over = [c for c in configs if any((c['scaling'][v]['efficiency_percent'] or 0) > 100 for v in ('before', 'after'))]
     if not over:
         return None
+    if not ctx.cycles:
+        return 'Efficiency above 100%: no cycle counter on this CPU; cause not isolated'
     c8 = max(over, key=lambda c: (c['queries'], c['threads']))
     c1 = ctx.one('throughput', database=db, profile=profile, operation=op, family=c8['family'],
                  queries=c8['queries'], threads=1)
@@ -259,8 +307,10 @@ def build_memory(ctx, standalone):
     title = 'Memory Usage — Reader State and Process RSS'
     subtitle = (f'Fresh process per measurement · median of {ctx.memory_iterations} · random lookups · '
                 'heap = mallinfo2 in-use bytes; RSS = whole process')
+    corpus = {r['family']: r['before']['corpus_mib'] for r in ctx.select('memory', database='city', queries=SIZE, threads=1)}
     footer = ['Peak = VmHWM after resetting the high-water mark at the end of warm-up (lookup phase only) · '
-              'peak rows include the identical 10M query corpus (152.6 MiB IPv4, 267.0 MiB IPv6)',
+              f'peak rows include the identical {SIZE_LABEL[SIZE]} query corpus ('
+              + ', '.join(f'{fmt_mib(corpus[f])} IPv{f}' for f in FAMILIES if f in corpus) + ')',
               ctx.cpu_line(),
               f'GeoLite2-City {ctx.databases["city"]["build_date"]} and synthetic fixture · Before {ctx.before_short} · After {ctx.after_short} · '
               'benchmarks/reports/performance-comparison']
@@ -372,6 +422,9 @@ def build_matrix(ctx, db, standalone):
 
 
 # Exports and manifest ----------------------------------------------------------
+RADIX16_TITLE = 'Radix-16 Preparation and Lookup'
+
+
 def export_specs(ctx):
     specs = []
     for family in FAMILIES:
@@ -404,6 +457,8 @@ def export_specs(ctx):
          'build': lambda s: build_scaling(ctx, 'city', 'random', 'lookup', s), 'kind': 'scaling'},
         {'id': 'allocations', 'title': 'Heap Allocations per Lookup + Field Decode',
          'build': lambda s: build_allocations(ctx, s), 'kind': 'allocations'},
+        {'id': 'radix16-preparation', 'title': RADIX16_TITLE, 'kind': 'diagram',
+         'build': lambda s: diagram.radix16_diagram(ctx, SIZE, RADIX16_TITLE, [ctx.cpu_line(), ctx.data_line('city')])},
     ]
     for db in ctx.timed_dbs:
         specs.append({'id': f'speedup-matrix-{db}', 'title': f'Throughput Speedup Matrix — {DB_LABEL[db]}',
@@ -445,10 +500,14 @@ def caption_for(ctx, spec):
                 '(After prepares the native tree and radix-16 tables before returning).')
     if kind == 'scaling':
         return ('Throughput relative to one worker for random GeoLite2-City lookups; both versions are compared '
-                'with ideal linear scaling at 1, 4 and 8 workers.')
+                f'with ideal linear scaling at {joined(THREADS)} workers.')
     if kind == 'allocations':
         return ('Before allocates one temporary lookup-path array per MMDB_get_value call on a hit; After uses a '
                 'stack buffer for paths of up to seven components and allocates nothing.')
+    if kind == 'diagram':
+        return (f'{ctx.after_short}: MMDB_open converts the packed tree once into aligned native nodes and 16-bit root '
+                'tables; a lookup replaces the first 16 tree levels with one table load and walks the rest without '
+                'decoding packed records.')
     if kind == 'matrix':
         head = ctx.s['headline']['throughput'][spec['database']]
         return (f'All {head["configurations"]} throughput configurations on {DB_LABEL[spec["database"]]}: geometric mean '
@@ -463,7 +522,9 @@ def alt_for(ctx, spec):
             'startup': 'Bar chart comparing database opening time of Before and After',
             'scaling': 'Line charts of thread scaling for Before and After against ideal scaling',
             'allocations': 'Bar chart of heap allocations per lookup for Before and After',
-            'matrix': 'Heat table of throughput speedups for every configuration'}[spec['kind']]
+            'matrix': 'Heat table of throughput speedups for every configuration',
+            'diagram': 'Diagram of the automatic radix-16 preparation in MMDB_open and of a prepared lookup, with '
+                       'why it is faster'}[spec['kind']]
     return f'{base} on {ctx.cpu}: {spec["title"]}'
 
 
@@ -515,10 +576,11 @@ display:flex;flex-wrap:wrap;align-items:flex-end;gap:14px 22px;padding:12px 0;ma
 .control{display:flex;flex-direction:column;gap:5px}
 .control>span{font:600 10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--surface)}
-.seg button{background:transparent;color:var(--text2);border:0;border-right:1px solid var(--line);padding:7px 12px;font:600 12.5px/1.2 var(--mono);cursor:pointer}
-.seg button:last-child{border-right:0}
+.seg button{background:transparent;color:var(--text2);border:0;padding:7px 12px;font:600 12.5px/1.2 var(--mono);cursor:pointer}
+.seg button+button{border-left:1px solid var(--line)}
 .seg button:hover{background:var(--surface2)}
 .seg button[aria-pressed=true]{background:var(--accent-bg);color:var(--accent)}
+.seg button[hidden]{display:none}
 .seg button:focus-visible,.mark:focus-visible,th button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .chart-card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px 22px 12px;margin:16px 0}
 .chart-card.hero{border-color:#2c4a3e;box-shadow:0 0 0 1px #14372c inset}
@@ -556,8 +618,20 @@ footer{margin-top:60px;color:var(--muted);font-size:12.5px;border-top:1px solid 
 
 JS = r"""
 (function(){
-const state={db:'city',profile:'random',op:'lookup',family:'all',threads:'all',all:false};
+const arch=document.querySelector('[data-control="arch"]');
+const state={db:'city',profile:'random',op:'lookup',family:'all',threads:'all',all:false,
+  arch:arch?arch.querySelector('button').dataset.value:''};
+const wanted=new URLSearchParams(location.search).get('arch');
+if(arch&&[...arch.querySelectorAll('button')].some(b=>b.dataset.value===wanted))state.arch=wanted;
 function apply(){
+  // Merged report: show one architecture and only the options it measured.
+  document.querySelectorAll('[data-arch]').forEach(el=>{el.hidden=el.dataset.arch!==state.arch;});
+  document.querySelectorAll('[data-arches]').forEach(b=>{b.hidden=!b.dataset.arches.split(' ').includes(state.arch);});
+  document.querySelectorAll('[data-control]').forEach(group=>{
+    const key=group.dataset.control;
+    const current=[...group.querySelectorAll('button')].find(b=>b.dataset.value===String(state[key]));
+    if(current&&current.hidden)state[key]=group.querySelector('button:not([hidden])').dataset.value;
+  });
   document.querySelectorAll('[data-panel]').forEach(p=>{
     const d=p.dataset;
     const ok=(!d.db||d.db===state.db)&&(!d.profile||d.profile===state.profile)&&(!d.op||d.op===state.op)&&
@@ -580,6 +654,7 @@ function apply(){
 }
 document.querySelectorAll('[data-control] button').forEach(b=>b.addEventListener('click',()=>{
   const key=b.closest('[data-control]').dataset.control;state[key]=b.dataset.value;apply();
+  if(key==='arch'){const url=new URL(location.href);url.searchParams.set('arch',state.arch);history.replaceState(null,'',url);}
 }));
 const all=document.getElementById('show-all');
 if(all){all.addEventListener('change',()=>{state.all=all.checked;apply();});}
@@ -623,8 +698,11 @@ apply();
 """
 
 
-def seg(key, label, options, default):
-    buttons = ''.join(f'<button type="button" data-value="{esc(v)}" aria-pressed="{str(v == default).lower()}">{esc(t)}</button>'
+def seg(key, label, options, default, arches=None):
+    """A filter control; arches maps an option to the architectures that have it (merged report)."""
+    arches = arches or {}
+    buttons = ''.join(f'<button type="button" data-value="{esc(v)}" aria-pressed="{str(v == default).lower()}"'
+                      + (f' data-arches="{esc(" ".join(arches[v]))}"' if v in arches else '') + f'>{esc(t)}</button>'
                       for v, t in options)
     return (f'<div class="control"><span id="lbl-{key}">{esc(label)}</span>'
             f'<div class="seg" role="group" aria-labelledby="lbl-{key}" data-control="{key}">{buttons}</div></div>')
@@ -802,7 +880,7 @@ def throughput_section(ctx, size, hero=True):
                     svg = build_throughput(ctx, db, profile, op, family, size, False)
                     title = throughput_title(family, profile, op, size)
                     subtitle = (f'{DB_LABEL[db]} · {PROFILE_TEXT[profile]} ({fmt_hits(configs[0]["hit_ratio"])} hits) · {ctx.operation_text(db, op)} · '
-                                f'{size:,} queries in total, split across 1, 4 and 8 pinned workers · median of {ctx.reps} runs, '
+                                f'{size:,} queries in total, split across {joined(THREADS)} pinned workers · median of {ctx.reps} runs, '
                                 '95% bootstrap CI')
                     out.append(chart_panel(svg, title, subtitle, {'db': db, 'profile': profile, 'op': op, 'family': family},
                                            hero=hero))
@@ -842,7 +920,7 @@ def headline_cards(ctx):
          f'95% CI ×{city["geomean_ci95_low"]:.2f}–{city["geomean_ci95_high"]:.2f} · {city["faster"]} faster, '
          f'{city["slower"]} slower, {city["inconclusive"]} inconclusive'),
         ('Random lookups, GeoLite2-City', fmt_speedup(crl['geomean_speedup']),
-         f'{crl["configurations"]} configurations (IPv4/IPv6 × 1/4/8 threads, {SIZE_LABEL[SIZE]} queries) · range '
+         f'{crl["configurations"]} configurations (IPv4/IPv6 × {"/".join(str(t) for t in THREADS)} threads, {SIZE_LABEL[SIZE]} queries) · range '
          f'{fmt_speedup(crl["min_speedup"])}–{fmt_speedup(crl["max_speedup"])}'),
     ] + ([
         ('Synthetic fixture throughput', fmt_speedup(syn['geomean_speedup']),
@@ -868,48 +946,104 @@ def environment_block(ctx):
     cpu = env['cpu']
     host = ctx.s['host_activity'] or {}
     build = ctx.s['build']
+    busiest = max(ctx.s['throughput'], key=lambda c: c['threads'])
+    smt = ('SMT active' if cpu['smt_active'] == '1'
+           else 'SMT inactive' if (cpu.get('threads_per_core') or 1) > 1 else 'no SMT')
+    first = cpu['topology'][0] if cpu.get('topology') else {}
+    policy = ([f'amd-pstate {cpu["amd_pstate"]}'] if cpu.get('amd_pstate') else []) + \
+             ([f'governor {ctx.governor}'] if ctx.governor else []) + \
+             ([f'EPP {first["energy_performance_preference"]}'] if first.get('energy_performance_preference') else []) + \
+             ([f'boost {"on" if cpu["boost"] == "1" else "off"}'] if cpu.get('boost') is not None else []) + \
+             ([f'max {float(cpu["max_mhz"]):.0f} MHz'] if cpu.get('max_mhz') else [])
+    target = env['toolchain'].get('gcc_target') or (
+        {'arch': 'x86-64', 'tune': 'generic'} if env['os']['architecture'] == 'x86_64' else {})
+    target = ' '.join(f'-m{k}={target[k]}' for k in ('arch', 'cpu', 'tune') if target.get(k)) or ctx.arch
+    paranoid = env['os']['perf_event_paranoid']
+    perf = 'perf unavailable' if paranoid and int(paranoid) > 2 else 'perf not used'
+    counters = ('core cycles read with AMD RDPRU (APERF)' if ctx.cycles
+                else 'no cycle counter readable from user space, so no cycles per lookup')
+    ci = ctx.ci or {}
     rows = [
         ('CPU model', cpu['model']),
-        ('Topology', f'{cpu["sockets"]} socket · {cpu["physical_cores"]} physical cores · {cpu["logical_cpus"]} logical CPUs · '
-                     f'SMT {"active" if cpu["smt_active"] == "1" else "inactive"}'),
+        ('Architecture', f'{ctx.arch} ({env["toolchain"].get("gcc_target", {}).get("machine") or env["os"]["architecture"]})'),
+        ('Topology', f'{plural(cpu["sockets"], "socket")} · {cpu["physical_cores"]} physical cores · {cpu["logical_cpus"]} logical CPUs · '
+                     f'{smt}'),
         ('CPUs available to the benchmark', f'{cpu["available_to_benchmark"]} (affinity {cpu["affinity"][0]}–{cpu["affinity"][-1]}; '
                                             f'cgroup CPU quota: {env["os"]["cgroup"]["cpu.max"]})'),
-        ('Worker placement', 'first SMT sibling of each physical core, ordered by ACPI CPPC rank: '
-                             f'CPUs {", ".join(str(c) for c in ctx.s["throughput"][-1]["worker_cpus"])} — never oversubscribed'),
-        ('Caches', ', '.join(f'{k} {v}' for k, v in cpu['caches'].items())),
-        ('Instruction sets (relevant)', ' '.join(cpu['instruction_sets'])),
-        ('Frequency policy', f'amd-pstate {cpu["amd_pstate"]}, governor performance, EPP performance, boost {"on" if cpu["boost"] == "1" else "off"}, '
-                             f'max {float(cpu["max_mhz"]):.0f} MHz'),
+        ('Worker placement', f'{"first SMT sibling of each physical core" if ctx.smt else "one logical CPU per physical core"}, '
+                             f'{"ordered by ACPI CPPC rank" if ctx.ranked else "in CPU number order"}: '
+                             f'CPUs {", ".join(str(c) for c in busiest["worker_cpus"])} — '
+                             f'{"oversubscribed" if any(c["oversubscribed"] for c in ctx.s["throughput"]) else "never oversubscribed"}'),
+        ('Caches', ', '.join(f'{k} {v}' for k, v in cpu['caches'].items() if v) or 'not reported'),
+        ('Instruction sets (relevant)', ' '.join(cpu['instruction_sets']) or 'none of the recorded ones'),
+        ('Frequency policy', ', '.join(policy) or 'not visible from this machine (no cpufreq interface)'),
         ('Memory', f'{env["memory"]["MemTotal_kib"] / 1024 / 1024:.1f} GiB RAM · {env["memory"]["MemAvailable_kib"] / 1024 / 1024:.1f} GiB available at start · '
                    f'THP {env["transparent_hugepage"]["enabled"]}'),
         ('OS / kernel', f'{env["os"]["pretty_name"]} · Linux {env["os"]["kernel"]} · clocksource {env["os"]["clocksource"]} · '
                         f'virtualization: {env["os"]["virtualization"]}'),
         ('Compilers', f'{env["toolchain"]["gcc"]} · {env["toolchain"]["cmake"]} · ninja {env["toolchain"]["ninja"]} · {env["toolchain"]["glibc"]}'),
-        ('Library build', build['library_compile_commands'].get('after', '') + '  (GCC default target: -march=x86-64 -mtune=generic; no ISA-specific flags)'),
-        ('Hardware counters', f'perf_event_paranoid={env["os"]["perf_event_paranoid"]}: perf unavailable; core cycles read with AMD RDPRU (APERF)'),
-        ('Host activity', f'shared desktop; system CPU busy median {host.get("system_cpu_busy_median", 0) * 100:.1f}% '
+        ('Library build', build['library_compile_commands'].get('after', '') + f'  (GCC default target: {target}; no ISA-specific flags)'),
+        ('Hardware counters', f'perf_event_paranoid={paranoid}: {perf}; {counters}'),
+    ] + ([
+        ('Runner', f'{ci.get("service")} {ci.get("runner_environment") or ""} runner {ci.get("runner_name") or ""} · '
+                   f'image {ci.get("imageos") or "?"} {ci.get("imageversion") or ""} · run {ci.get("github_run_id")} · '
+                   f'{ci.get("github_repository")}@{(ci.get("github_sha") or "")[:7]}'),
+    ] if ctx.ci else []) + [
+        ('Host activity', f'{ctx.host()}; system CPU busy median {host.get("system_cpu_busy_median", 0) * 100:.1f}% '
                           f'(p90 {host.get("system_cpu_busy_p90", 0) * 100:.1f}%), load average median {host.get("loadavg1_median", 0):.2f}'),
     ]
     return '<div class="kv">' + ''.join(f'<div>{esc(k)}</div><div>{esc(v)}</div>' for k, v in rows) + '</div>'
 
 
+def filters_html(ctxs):
+    """The sticky filter bar. With several architectures (merged report) an
+    Architecture control comes first and every option lists the architectures
+    that measured it, so the page only offers what the shown one has."""
+    merged = len(ctxs) > 1
+
+    def measured(field, options):
+        found = []
+        for value, text in options:
+            have = [c.key for c in ctxs if any(str(x[field]) == str(value) for x in c.s['throughput'])]
+            if have:
+                found.append((value, text, have))
+        return found
+
+    def measured_seg(key, field, label, options):
+        found = measured(field, options)
+        return (seg(key, label, [(v, t) for v, t, _ in found], found[0][0],
+                    {v: have for v, _, have in found} if merged else None) if len(found) > 1 else '')
+    counts = sorted({x['threads'] for c in ctxs for x in c.s['throughput']})
+    threads = measured('threads', [(t, str(t)) for t in counts])
+    return ('<nav class="filters" aria-label="Report filters">'
+            + (seg('arch', 'Architecture', [(c.key, c.arch) for c in ctxs], ctxs[0].key) if merged else '')
+            + measured_seg('db', 'database', 'Database', [('city', 'GeoLite2-City'), ('synthetic', 'Synthetic')])
+            + measured_seg('profile', 'profile', 'Workload profile', [('random', 'Random'), ('hits', 'Populated networks')])
+            + measured_seg('op', 'operation', 'Operation', [('lookup', 'Lookup'), ('decode', 'Lookup + decode')])
+            + seg('family', 'IP family', [('all', 'Both'), ('4', 'IPv4'), ('6', 'IPv6')], 'all')
+            + seg('threads', 'Highlight threads', [('all', 'All')] + [(str(t), str(t)) for t, _, _ in threads], 'all',
+                  {str(t): have for t, _, have in threads} if merged else None)
+            + '<label class="control"><span>Tables</span><span style="font:13px var(--sans);text-transform:none;letter-spacing:0;color:var(--text2)">'
+            '<input type="checkbox" id="show-all"> show every configuration</span></label></nav>')
+
+
+def document(title, body):
+    return (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{esc(title)}</title><style>{CSS}</style></head><body><div class="wrap">'
+            + body + '</div><div id="tooltip" role="tooltip"></div>'
+            f'<script>{JS}</script></body></html>\n')
+
+
 def html_report(ctx, manifest):
+    top, rest = report_sections(ctx, manifest)
+    return document(f'libmaxminddb Before/After Performance — {ctx.cpu}', ''.join(top) + filters_html([ctx]) + ''.join(rest))
+
+
+def report_sections(ctx, manifest):
+    """The report above the filter bar (header, cards, note) and below it."""
     s = ctx.s
     v = s['validation']
     proto = s['protocol']
-    title = f'libmaxminddb Before/After Performance — {ctx.cpu}'
-    def measured_seg(key, field, label, options):
-        found = {c[field] for c in s['throughput']}
-        options = [(v, t) for v, t in options if v in found]
-        return seg(key, label, options, options[0][0]) if len(options) > 1 else ''
-    filters = ('<nav class="filters" aria-label="Report filters">'
-               + measured_seg('db', 'database', 'Database', [('city', 'GeoLite2-City'), ('synthetic', 'Synthetic')])
-               + measured_seg('profile', 'profile', 'Workload profile', [('random', 'Random'), ('hits', 'Populated networks')])
-               + measured_seg('op', 'operation', 'Operation', [('lookup', 'Lookup'), ('decode', 'Lookup + decode')])
-               + seg('family', 'IP family', [('all', 'Both'), ('4', 'IPv4'), ('6', 'IPv6')], 'all')
-               + seg('threads', 'Highlight threads', [('all', 'All'), ('1', '1'), ('4', '4'), ('8', '8')], 'all')
-               + '<label class="control"><span>Tables</span><span style="font:13px var(--sans);text-transform:none;letter-spacing:0;color:var(--text2)">'
-               '<input type="checkbox" id="show-all"> show every configuration</span></label></nav>')
     memory_panels = ''.join(chart_panel(build_memory(ctx, False), 'Memory Usage — Reader State and Process RSS',
                                         f'Fresh process per measurement, median of {ctx.memory_iterations} · heap from mallinfo2 · RSS is whole-process',
                                         {}, caption_for(ctx, {'kind': 'memory'})) for _ in [0])
@@ -920,17 +1054,19 @@ def html_report(ctx, manifest):
         f'<code>{s["after"]["commit"]}</code> (three commits: specialized packed traversal, allocation-free short '
         'MMDB_get_value() paths, then automatic radix-16 preparation with aligned native child records). Same harness source, identical compiler '
         f'flags, static libraries, {v["measured_runs"]:,} measured runs and {v["measured_lookups"] / 1e9:.2f} billion measured lookups.</p>'
-        f'<div class="meta"><span><b>CPU</b> {esc(ctx.cpu)}</span><span><b>Cores</b> {ctx.cores} / {ctx.logical} threads</span>'
+        f'<div class="meta"><span><b>CPU</b> {esc(ctx.cpu)}</span><span><b>Architecture</b> {esc(ctx.arch)}</span>'
+        f'<span><b>Cores</b> {ctx.cores} / {ctx.logical} threads</span>'
         f'<span><b>OS</b> {esc(ctx.os)} · Linux {esc(ctx.kernel)}</span><span><b>Compiler</b> GCC {esc(ctx.gcc)} -O3 -DNDEBUG</span>'
         f'<span><b>Repetitions</b> {ctx.reps} per configuration, alternating order</span>'
         f'<span><b>Recorded</b> {esc(s["environment"]["recorded"])}</span></div></header>',
         headline_cards(ctx),
-        '<p class="note">All values come from <code>performance-comparison-data/summary.json</code>. Speedup = After / Before '
+        f'<p class="note">All values come from <code>{ctx.prefix}performance-comparison-data/summary.json</code>. Speedup = After / Before '
         'median throughput; change = (speedup − 1) × 100; latency reduction = (1 − After / Before) × 100. '
         'Hover or focus any bar, candle or cell for exact values; every value is also in the tables below.</p>',
-        filters,
-        f'<h2 id="throughput">Throughput at {SIZE_LABEL[SIZE]} queries</h2><p class="lead">Total work is fixed: 1 worker '
-        f'performs {SIZE:,} lookups, 4 workers {SIZE // 4:,} each, 8 workers {SIZE // 8:,} each.</p>',
+        None,
+        f'<h2 id="throughput">Throughput at {SIZE_LABEL[SIZE]} queries</h2><p class="lead">Total work is fixed: '
+        + ', '.join(f'1 worker performs {SIZE:,} lookups' if t == 1 else f'{t} workers {SIZE // t:,} each' for t in THREADS)
+        + '.</p>',
         throughput_section(ctx, SIZE),
         '<h2 id="latency">Latency distribution</h2><p class="lead">Separate latency campaign: one actual operation in '
         f'every {proto["latency_sampling_stride"]} is timed individually; workers are merged and repetitions pooled before '
@@ -985,10 +1121,39 @@ def html_report(ctx, manifest):
         '<code>benchmarks/reporting/report.py</code> from saved results. Measured on '
         f'{esc(ctx.cpu)}. Before {s["before"]["commit"]} · After {s["after"]["commit"]}.</footer>',
     ]
-    return (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<title>{esc(title)}</title><style>{CSS}</style></head><body><div class="wrap">'
-            + ''.join(sections) + '</div><div id="tooltip" role="tooltip"></div>'
-            f'<script>{JS}</script></body></html>\n')
+    split = sections.index(None)
+    return sections[:split], sections[split + 1:]
+
+
+# Preferred order of the architectures in the merged report.
+ARCH_ORDER = ('x86_64', 'aarch64')
+
+
+def merged_report(site):
+    """One page with the reports of every architecture directory in site,
+    switched by the Architecture filter. Figures stay in each directory."""
+    directories = sorted((p.parent.parent for p in Path(site).glob('*/performance-comparison-data/summary.json')),
+                         key=lambda d: (ARCH_ORDER.index(d.name) if d.name in ARCH_ORDER else len(ARCH_ORDER), d.name))
+    if len(directories) < 2:
+        raise SystemExit(f'{site}: a merged report needs at least two architecture directories')
+    ctxs, tops, rests = [], [], []
+    for index, directory in enumerate(directories):
+        summary = json.loads((directory / 'performance-comparison-data/summary.json').read_text())
+        manifest = json.loads((directory / 'performance-comparison-assets/manifest.json').read_text())
+        configure(summary)
+        ctx = Context(summary, key=directory.name, prefix=f'{directory.name}/')
+        top, rest = report_sections(ctx, [{**m, 'png': ctx.prefix + m['png'], 'svg': ctx.prefix + m['svg']}
+                                          for m in manifest])
+        top, rest = ''.join(top), ''.join(rest)
+        if index:
+            # Element ids stay unique: those of the first architecture are kept.
+            top, rest = (re.sub(r'\bid="([^"]+)"', rf'id="{ctx.key}-\1"', part) for part in (top, rest))
+        hidden = ' hidden' if index else ''
+        tops.append(f'<div data-arch="{esc(ctx.key)}"{hidden}>{top}</div>')
+        rests.append(f'<div data-arch="{esc(ctx.key)}"{hidden}>{rest}</div>')
+        ctxs.append(ctx)
+    title = 'libmaxminddb Before/After Performance — ' + joined(f'{c.cpu} ({c.arch})' for c in ctxs)
+    return document(title, ''.join(tops) + filters_html(ctxs) + ''.join(rests))
 
 
 def attribution_html(ctx):
@@ -1055,9 +1220,12 @@ def methodology_html(ctx):
                                'RSS stages read from /proc/self/status; the lookup-phase '
                                'peak resets VmHWM through /proc/self/clear_refs after warm-up. Heap = mallinfo2 in-use bytes; '
                                'database mapping residency from /proc/self/smaps.'),
-        ('Counters', 'CPU utilization = thread CPU time (RUSAGE_THREAD) / (wall time × workers). Core cycles per lookup = '
-                     'APERF delta via RDPRU on each pinned worker CPU / completed lookups. Cache-miss and branch-miss '
-                     'counters are unavailable (perf_event_paranoid = 4).'),
+        ('Counters', 'CPU utilization = thread CPU time (RUSAGE_THREAD) / (wall time × workers). '
+                     + ('Core cycles per lookup = APERF delta via RDPRU on each pinned worker CPU / completed lookups. '
+                        if ctx.cycles else 'No cycle counter is readable from user space on this CPU, so cycles per '
+                        'lookup are not reported. ')
+                     + f'Cache-miss and branch-miss counters are unavailable (perf_event_paranoid = '
+                       f'{ctx.env["os"]["perf_event_paranoid"]}).'),
     ]
     return '<div class="grid2" style="margin-top:18px">' + ''.join(
         f'<div class="card"><div class="label">{esc(a)}</div><div class="detail" style="font-size:13.5px;margin-top:6px">{esc(b)}</div></div>'
@@ -1078,13 +1246,33 @@ def limitations(ctx):
                 f'{ctx.scope("latency")}, with {ctx.reps} repetitions per version and configuration.'
                 + (f' The {joined(left_out)} only enter the differential, memory, startup and allocation measurements.'
                    if left_out else ''))
+    if ctx.ci:
+        host_text = ('GitHub-hosted runner: a virtual machine on shared cloud hardware, not an isolated benchmark host. '
+                     'Other tenants of the physical host and the runner\'s own processes kept running (largest mean '
+                     f'consumers: {top}), and the guest\'s core topology need not match the physical one. ')
+    elif ctx.host() != 'shared desktop':
+        host_text = (f'{ctx.host()[0].upper()}{ctx.host()[1:]}, not an isolated benchmark host: other processes kept '
+                     f'running (largest mean consumers: {top}). ')
+    else:
+        host_text = f'Shared desktop, not an isolated benchmark host: other processes kept running (largest mean consumers: {top}). '
+    enabled = (['Turbo boost'] if ctx.env['cpu'].get('boost') == '1' else []) + (['SMT'] if ctx.smt else [])
+    frequency = (f'{" and ".join(enabled)} {"stay" if len(enabled) > 1 else "stays"} enabled'
+                 + (f' (governor {ctx.governor}).' if ctx.governor else '.') if enabled else '')
+    if not ctx.governor:
+        frequency += ' CPU frequency is not visible from this machine (no cpufreq interface).'
+    frequency += (' Single-thread results run on the highest-ranked core.' if ctx.ranked
+                  else ' Single-thread results run on the first allowed CPU.')
+    stride = ctx.s['protocol']['latency_sampling_stride']
+    other = {'x86-64': 'AArch64', 'AArch64': 'x86-64'}.get(ctx.arch)
+    grid = ctx.s['protocol'].get('timer_granularity') or {}
+    clock = CLOCK_LABEL.get(ctx.env['os']['clocksource'], f'{ctx.env["os"]["clocksource"]} clock')
     return [
         coverage,
-        f'Shared desktop, not an isolated benchmark host: other processes kept running (largest mean consumers: {top}). '
-        f'Alternating order, per-repetition warm-up and {ctx.reps} repetitions limit, but do not remove, their effect; '
-        '8-worker runs occupy every physical core and are the most exposed.',
-        'Turbo boost and SMT stay enabled (governor performance). Single-thread results run on the highest-ranked core.',
-        'Latency percentiles describe sampled operations (one in sixteen) and include the timer-read overhead; '
+        host_text + f'Alternating order, per-repetition warm-up and {ctx.reps} repetitions limit, but do not remove, their effect; '
+        f'{ctx.max_threads}-worker runs occupy {"every physical core" if ctx.max_threads >= ctx.cores else ctx.busiest()} '
+        'and are the most exposed.',
+        frequency.strip(),
+        f'Latency percentiles describe sampled operations (one in {"sixteen" if stride == 16 else stride}) and include the timer-read overhead; '
         'the maximum is the largest sampled value, not of every lookup.',
         f'GeoLite2-City is a real database (build {ctx.databases["city"]["build_date"]}) that cannot be redistributed; '
         'the synthetic fixture is '
@@ -1093,29 +1281,65 @@ def limitations(ctx):
         + ('; the populated-network profile weights every network equally regardless of its size, which overrepresents '
            'long prefixes compared with real traffic.' if 'hits' in ctx.timed_profiles
            else ', so random IPv6 results mostly measure misses.'),
-        'Results are specific to this x86-64 CPU, compiler and memory hierarchy; no AArch64 or 32-bit measurements.',
+        f'Results are specific to this {ctx.arch} CPU, compiler and memory hierarchy; this report has no '
+        + (f'{other} or ' if other else '') + '32-bit measurements.',
     ] + ([
-        'Some configurations show parallel efficiency above 100%: APERF cycles per lookup per worker decrease with more '
-        'workers. The mechanism (for example memory and fabric power management at low load) was not isolated.',
+        ('Some configurations show parallel efficiency above 100%: APERF cycles per lookup per worker decrease with more '
+         'workers. The mechanism (for example memory and fabric power management at low load) was not isolated.')
+        if ctx.cycles else
+        ('Some configurations show parallel efficiency above 100%. The mechanism was not isolated; no cycle counter '
+         'was available to check whether per-lookup cost changes with the number of workers.'),
     ] if ctx.superlinear() else []) + [
         'Cache-miss and branch-miss counters were unavailable; cycles per lookup come from APERF and include any '
-        'interference on the pinned CPU.',
-        'The TSC-backed clock advances in steps of about 10 ns on this CPU '
-        f'({(ctx.s["protocol"].get("timer_granularity") or {}).get("on_10ns_grid_fraction", 0) * 100:.1f}% of latency samples fall on '
-        'a 10 ns grid), so sub-50 ns latency percentiles are coarse.',
-    ]
+        'interference on the pinned CPU.' if ctx.cycles else
+        'Cycle, cache-miss and branch-miss counters were unavailable; only wall-clock and thread CPU time were measured.',
+    ] + ([
+        f'The {clock} advances in steps of about {ctx.timer_step} ns on this CPU '
+        f'({grid["on_grid_fraction"] * 100:.1f}% of latency samples fall on '
+        f'a {ctx.timer_step} ns grid), so sub-{5 * ctx.timer_step} ns latency percentiles are coarse.',
+    ] if ctx.timer_step else [])
+
+
+def campaign_minutes(ctx):
+    """Minutes between the environment snapshots taken before and after the measurements."""
+    end = ctx.s.get('environment_end')
+    if not end:
+        return None
+    start, stop = (datetime.datetime.fromisoformat(e['recorded']) for e in (ctx.env, end))
+    return max(1, round((stop - start).total_seconds() / 60))
 
 
 def reproduce(ctx):
     city = ctx.databases['city']
+    minutes = campaign_minutes(ctx)
+    took = f'; the measurements took {minutes} min on the machine above' if minutes else ''
+    ci = ('# GitHub Actions measures x86-64 and AArch64 runners for every pushed benchmarks/* branch\n'
+          f'# (.github/workflows/benchmarks.yml); this report comes from run {ctx.ci.get("github_run_id")}.\n'
+          if ctx.ci else '')
     return ('# From the repository root. Needs Linux, GCC, Clang, CMake + Ninja, Autotools, OpenSSL headers,\n'
             '# Python 3.11+, Node.js and Chrome. Builds both revisions, runs every campaign and the test suites, then\n'
-            '# regenerates benchmarks/reports: about an hour on the machine above.\n'
+            f'# regenerates benchmarks/reports{took}.\n'
             'benchmarks/reproduce.sh /path/to/GeoLite2-City.mmdb   '
-            f'# build {city["build_date"]}, SHA-256 {city["sha256"][:8]}…{city["sha256"][-6:]}\n')
+            f'# build {city["build_date"]}, SHA-256 {city["sha256"][:8]}…{city["sha256"][-6:]}\n' + ci)
 
 
 # Pull request -------------------------------------------------------------------
+# The fork and branch that hold the benchmark tooling on top of After.
+REPOSITORY = 'https://github.com/0x00F6/libmaxminddb'
+# GitHub Pages of the fork: the workflow publishes every architecture of a benchmarks/<commit> branch there.
+PAGES = 'https://0x00f6.github.io/libmaxminddb'
+
+
+def pr_reproduce(ctx):
+    city = ctx.databases['city']
+    return '\n'.join([
+        f'git clone {REPOSITORY} -b benchmarks/{ctx.after_short}',
+        'cd libmaxminddb',
+        f'# GeoLite2-City build {city["build_date"]} (SHA-256 {city["sha256"][:8]}…{city["sha256"][-6:]}) cannot be '
+        'redistributed: save it as benchmarks/GeoLite2-City.mmdb.',
+        'benchmarks/reproduce.sh benchmarks/GeoLite2-City.mmdb'])
+
+
 def md_table(head, rows, align=None):
     align = align or ['---'] * len(head)
     out = ['| ' + ' | '.join(head) + ' |', '| ' + ' | '.join(align) + ' |']
@@ -1143,7 +1367,7 @@ def attribution_effect(ctx, key, label):
         return []
     values = [a[key]['ratio'] for a in rows]
     unclear = [a for a in rows if a[key]['ci95_low'] <= 1 <= a[key]['ci95_high']]
-    text = (f'- **{label}:** {fmt_speedup(min(values))}–{fmt_speedup(max(values))} on GeoLite2-City lookups '
+    text = (f'- 🚀 **{label}:** {fmt_speedup(min(values))}–{fmt_speedup(max(values))} on GeoLite2-City lookups '
             f'({len(rows)} configurations: {ctx.scope("attribution", database="city")})')
     if unclear:
         text += (f'; {len(unclear)} of the {len(rows)} intervals include ×1.00 ('
@@ -1167,8 +1391,8 @@ def pr_description(ctx, manifest):
                         and r['profile'] == 'hits' and r['operation'] == 'decode' and r['version'] == 'before')
     primary = ctx.one('throughput', database='city', profile='random', operation='lookup', family=4,
                       queries=SIZE, threads=1)
-    motivation = {'cycles_before': primary['before']['core_cycles_per_lookup']['median'],
-                  'cycles_after': primary['after']['core_cycles_per_lookup']['median'],
+    cycles = lambda v: (primary[v].get('core_cycles_per_lookup') or {}).get('median')
+    motivation = {'cycles_before': cycles('before'), 'cycles_after': cycles('after'),
                   'ns_before': 1000 / primary['before']['throughput_mlps']['median'],
                   'ns_after': 1000 / primary['after']['throughput_mlps']['median']}
     commits = [c[:7] for c in s['after']['commits']]
@@ -1195,71 +1419,78 @@ def pr_description(ctx, manifest):
                 f'{OP_TITLE[c["operation"]].lower()}, {SIZE_LABEL[c["queries"]]}, {c["threads"]} thread{"s" if c["threads"] > 1 else ""}')
 
     out = [f'# Improve performance +{title_pct}%', '',
-           f'> **Proposed title:** `Improve performance +{title_pct}%` — {fmt_pct(city["geomean_change_percent"])} is the '
-           f'geometric-mean throughput gain over all {city["configurations"]} GeoLite2-City configurations of the campaign '
-           f'({ctx.scope(database="city")}); the throughput charts below show the random lookups.', '',
            '## 🎯 Motivation', '',
            '`MMDB_lookup_sockaddr()` walks the search tree one prefix bit at a time, and every step depends on the '
            'previous one. In the current code each step also decodes a packed 24/28/32-bit record through a function '
            'pointer chosen at runtime, recomputes the node address and branches on the address bit. Below the cached IPv4 '
            'start node an IPv4 lookup still takes up to 32 such steps, an IPv6 lookup up to 128, so per-step overhead and '
            f'dependent loads dominate: a random IPv4 lookup on GeoLite2-City takes {motivation["ns_before"]:.0f} ns on one '
-           f'thread, {motivation["cycles_before"]:.0f} core cycles according to APERF. Every `MMDB_get_value()` '
+           'thread' + (f', {motivation["cycles_before"]:.0f} core cycles according to APERF' if motivation['cycles_before'] else '')
+           + '. Every `MMDB_get_value()` '
            'call additionally allocates and frees a temporary path array: one `calloc` per decoded hit '
            f'({alloc_before["bytes_per_lookup"]:.0f} bytes for `country → iso_code`).', '',
            'Readers are typically opened once and shared by many threads in servers, proxies and log pipelines, so '
            'steady-state lookup throughput and tail latency are what these changes target; the one-time cost moves into '
            '`MMDB_open()` and is quantified below.', '',
            '## ⚡ Optimizations', '',
-           f'### 1. Specialized packed traversal (`{commits[0]}`)', '',
-           '- **What:** `find_address_in_search_tree()` dispatches once per lookup on the record width (6/7/8-byte '
+           f'### 1. 🧭 Specialized packed traversal (`{commits[0]}`)', '',
+           '- 🔧 **What:** `find_address_in_search_tree()` dispatches once per lookup on the record width (6/7/8-byte '
            'nodes) and runs a loop with that width as a constant; the child is selected arithmetically '
            '(`record_pointer + 3 * bit` etc.) instead of a branch plus an indirect getter call per bit.',
-           '- **Why it helps:** removes an indirect call and a data-dependent branch from every step of the dependent '
+           '- 💡 **Why it helps:** removes an indirect call and a data-dependent branch from every step of the dependent '
            'chain and lets the compiler inline the 24/28/32-bit decoder.',
-           '- **Safety:** bounds are checked as 64-bit byte offsets before a pointer is formed; the mapped tree format, '
+           '- 🛡️ **Safety:** bounds are checked as 64-bit byte offsets before a pointer is formed; the mapped tree format, '
            'structure layouts and error codes are unchanged. This is also the path used when preparation is disabled '
            'or cannot be built.',
-           '- **Validation:** new `t/lookup_specialization_t.c` compares every node encoding and both families with '
+           '- 🧪 **Validation:** new `t/lookup_specialization_t.c` compares every node encoding and both families with '
            '`MMDB_read_node()`-based traversal, plus truncated-tree checks.',
            ] + attribution_effect(ctx, 'packed_vs_before', 'Effect (separate measurement, After opened with '
                                   '`MMDB_NO_PREPARE`)') + ['',
-           f'### 2. Allocation-free short `MMDB_get_value()` paths (`{commits[1]}`)', '',
-           '- **What:** `MMDB_vget_value()` keeps lookup paths of up to seven components in an eight-pointer stack array; '
+           f'### 2. 🪶 Allocation-free short `MMDB_get_value()` paths (`{commits[1]}`)', '',
+           '- 🔧 **What:** `MMDB_vget_value()` keeps lookup paths of up to seven components in an eight-pointer stack array; '
            'longer paths keep the checked heap allocation.',
-           f'- **Effect (measured):** {alloc_before["allocations_per_lookup"]:.3f} → 0 allocations per lookup on '
+           f'- 🚀 **Effect (measured):** {alloc_before["allocations_per_lookup"]:.3f} → 0 allocations per lookup on '
            'hit-only decode workloads (instrumented binaries).',
-           '- **Validation:** `t/get_value_t.c` checks path lengths 0, 1, 7, 8, 9 and 12, i.e. both sides of the '
+           '- 🧪 **Validation:** `t/get_value_t.c` checks path lengths 0, 1, 7, 8, 9 and 12, i.e. both sides of the '
            'stack/heap boundary.', '',
-           f'### 3. Automatic radix-16 preparation with aligned native nodes (`{commits[2]}`)', '',
-           '- **What:** `MMDB_open()` now converts the packed tree once into a 64-byte-aligned array of native '
+           f'### 3. 🗂️ Automatic radix-16 preparation with aligned native nodes (`{commits[2]}`)', '',
+           '- 🔧 **What:** `MMDB_open()` now converts the packed tree once into a 64-byte-aligned array of native '
            '`uint32_t[2]` child pairs (8-byte nodes never straddle a cache line) and fills a 65,536-entry table that maps '
            'the first 16 address bits to the reached node and exact depth (plus a second table for the IPv4 subtree of '
            'IPv6 databases). `MMDB_lookup_sockaddr()`/`MMDB_lookup_string()` then skip up to 16 levels with one load and '
            'walk the native array without decoding packed records.',
-           '- **Format readers:** preparation uses direct 24/28/32-bit decoders over the sequential tree.',
-           '- **Ownership/ABI:** the prepared state lives in a private allocation reached through the reader\'s filename '
+           '- 🔢 **Format readers:** preparation uses direct 24/28/32-bit decoders over the sequential tree.',
+           '- 🧱 **Ownership/ABI:** the prepared state lives in a private allocation reached through the reader\'s filename '
            'allocation and a private flag bit; `MMDB_s` keeps its layout and the SONAME stays `0` (additive '
            '`-version-info 1:0:1`). An old executable built against the original header runs unchanged '
            '(`t/abi_compat_t.c`, `t/abi_legacy_client.c`).',
-           '- **Fallbacks:** if preparation cannot allocate or the native array would exceed 64 MiB, lookups use the '
+           '- 🪂 **Fallbacks:** if preparation cannot allocate or the native array would exceed 64 MiB, lookups use the '
            'specialized packed traversal. `MMDB_NO_PREPARE` opts out. Explicit `MMDB_create_lookup_context()` / '
            '`MMDB_lookup_*_with_context()` APIs expose the same structure for callers that manage it themselves.',
-           '- **Correctness:** early terminals fill the whole remaining key range with their exact depth, so prefix '
+           '- ✅ **Correctness:** early terminals fill the whole remaining key range with their exact depth, so prefix '
            'lengths and no-match results are unchanged; corrupt branches are reported only when a lookup reaches them.',
            ] + attribution_effect(ctx, 'after_vs_packed', 'Effect (separate measurement, on top of optimization 1)') + [
-           '- **Validation:** `t/lookup_context_t.c` compares prepared, explicit-context and packed lookups (random '
+           '- 🧪 **Validation:** `t/lookup_context_t.c` compares prepared, explicit-context and packed lookups (random '
            'sockaddr and string queries, exact prefixes, contexts shared by threads, corruption and lifetime cases); '
            '`t/abi_compat_t.c` checks the frozen public layouts and `t/abi_legacy_client.c` runs a client built with the '
-           'original header.',
-           '', '**Not included:** no SIMD, no prefetching, no new locks or atomics, and no change to how payloads are '
-           'decoded (strings were already borrowed from the mapping).', '',
+           'original header.', '',
+           fig('radix16-preparation'), '',
            '## 📊 Benchmarks', '',
+           f'🌐 **Complete benchmarks on x86-64 and AArch64:** {PAGES}/{ctx.after_short}/performance-comparison-benchmarks-{ctx.after_short}.html '
+           '(GitHub-hosted runners; switch with the Architecture filter). The environment and charts below come from the '
+           f'{ctx.cpu} campaign.', '',
            md_table(['', ''], [
                ['Before', f'`{s["before"]["commit"]}` (`main`, Merge pull request #512)'],
                ['After', after_row],
-               ['CPU', f'**{ctx.cpu}** — {ctx.cores} cores / {ctx.logical} threads, SMT on, boost on, governor performance'],
-               ['System', f'{ctx.env["memory"]["MemTotal_kib"] / 1024 / 1024:.1f} GiB RAM, {ctx.os}, Linux {ctx.kernel}, no VM, no cgroup CPU quota'],
+               ['CPU', f'**{ctx.cpu}** — {ctx.cores} cores / {ctx.logical} threads, ' + ', '.join(
+                   ['SMT on' if ctx.smt else 'no SMT']
+                   + ([f'boost {"on" if ctx.env["cpu"]["boost"] == "1" else "off"}'] if ctx.env['cpu'].get('boost') is not None else [])
+                   + ([f'governor {ctx.governor}'] if ctx.governor else ['no cpufreq interface']))],
+               ['System', f'{ctx.env["memory"]["MemTotal_kib"] / 1024 / 1024:.1f} GiB RAM, {ctx.os}, Linux {ctx.kernel}, '
+                          + (f'{ctx.virtualization} VM' + (' (GitHub-hosted runner)' if ctx.ci else '')
+                             if ctx.virtualization not in ('none', 'unknown') else 'no VM') + ', '
+                          + ('no cgroup CPU quota' if ctx.env['os']['cgroup']['cpu.max'].startswith(('max', 'not present'))
+                             else f'cgroup CPU quota {ctx.env["os"]["cgroup"]["cpu.max"]}')],
                ['Build', f'GCC {ctx.gcc}, CMake Release `-O3 -DNDEBUG`, static libraries, same harness source'],
                ['Databases', f'GeoLite2-City build {city_db["build_date"]} ({city_db["node_count"]:,} nodes, '
                              f'{city_db["record_size"]}-bit records); deterministic synthetic fixture from '
@@ -1325,7 +1556,11 @@ def pr_description(ctx, manifest):
                    'separate measurement).')
     out.append(f'- 📦 **Short paths only (`{commits[1]}`):** `MMDB_get_value()` avoids its allocation for paths of up to '
                'seven components; longer paths still allocate.')
-    out += ['', '## 🔁 Reproduction', '', '```sh', reproduce(ctx).strip(), '```', '',
+    minutes = campaign_minutes(ctx)
+    out += ['', '## 🔁 Reproduction', '', '```sh', pr_reproduce(ctx), '```', '',
+            'Needs Linux, GCC, Clang, CMake + Ninja, Autotools, OpenSSL headers, Python 3.11+, Node.js and Chrome. '
+            'The script builds both revisions, runs every campaign and the test suites, then regenerates '
+            '`benchmarks/reports`' + (f'; the measurements took {minutes} min on the machine above.' if minutes else '.'), '',
             'Full report: `benchmarks/reports/performance-comparison.html` (interactive); raw per-run JSON/CSV in '
             '`benchmarks/reports/performance-comparison-data/`. `benchmarks/reporting/generate.sh` regenerates the '
             'reports from the saved results without measuring.', '']
@@ -1354,6 +1589,13 @@ def write_manifest(manifest):
     (ASSETS / 'MANIFEST.md').write_text('\n'.join(lines))
 
 
+def configure(summary):
+    """Read the campaign's workload size and worker counts."""
+    global SIZE, THREADS
+    SIZE = workload_size(summary)
+    THREADS = tuple(sorted({c['threads'] for c in summary['throughput']}))
+
+
 def workload_size(summary):
     sizes = {c['queries'] for c in summary['throughput']}
     if len(sizes) != 1:
@@ -1362,14 +1604,19 @@ def workload_size(summary):
 
 
 def main():
-    global SIZE
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--summary', default=str(DATA / 'summary.json'))
     parser.add_argument('--output', default=str(REPORTS), help='directory receiving the reports and assets')
+    parser.add_argument('--merge', metavar='SITE',
+                        help='write one report of every architecture directory in SITE to --output (an HTML file)')
     args = parser.parse_args()
+    if args.merge:
+        Path(args.output).write_text(merged_report(args.merge))
+        print(f'Wrote {args.output}')
+        return
     set_output(args.output)
     summary = json.loads(Path(args.summary).read_text())
-    SIZE = workload_size(summary)
+    configure(summary)
     ctx = Context(summary)
     manifest = write_exports(ctx)
     HTML_OUT.write_text(html_report(ctx, manifest))

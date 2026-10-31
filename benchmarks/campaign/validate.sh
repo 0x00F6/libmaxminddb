@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # Run the project's test suites against the campaign snapshots and record the
-# results for the report. Run after the measurements: it is CPU intensive.
+# results for the report in WORK/raw/tests.json. Run after the measurements: it
+# is CPU intensive.
 
 set -eu -o pipefail
 
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 WORK=${WORK:-$REPO/benchmarks/artifacts/campaign}
-DATA=${DATA:-$REPO/benchmarks/reports/performance-comparison-data}
-JOBS=${JOBS:-8}
+JOBS=${JOBS:-$(nproc)}
 LOGS=$WORK/logs
-mkdir -p "$LOGS" "$DATA"
+mkdir -p "$LOGS" "$WORK/raw"
 START=${REPRODUCE_START:-$(date +%s)}
 
 log() {
@@ -59,7 +59,7 @@ cp -a "$WORK/src/after" "$WORK/build/after-autotools"
     fi
 )
 
-python3 - "$LOGS" "$WORK" "$DATA/tests.json" <<'EOF'
+python3 - "$LOGS" "$WORK" "$WORK/raw/tests.json" <<'EOF'
 import json, re, sys
 from pathlib import Path
 logs, work, output = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])

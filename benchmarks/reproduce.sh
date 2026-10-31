@@ -6,6 +6,9 @@
 # the start.
 #
 # Usage: benchmarks/reproduce.sh /path/to/GeoLite2-City.mmdb
+# A relative path that does not exist from the current directory is looked up
+# in benchmarks/: benchmarks/reproduce.sh GeoLite2-City.mmdb uses
+# benchmarks/GeoLite2-City.mmdb (ignored by git).
 #
 # The default protocol stays under five minutes on the measurement machine
 # (about four): every query count is 10M, the timed campaigns cover random
@@ -14,9 +17,14 @@
 # complete matrix of the earlier campaigns instead: both databases, both
 # profiles, 10 repetitions, about an hour.
 #
+# Worker counts follow the machine: 1, half and all of its physical cores, at
+# most 8 (1, 4 and 8 on the measurement machine).
+#
 # Everything is written to WORK (default benchmarks/artifacts/campaign). A
 # campaign already there is moved, with a copy of benchmarks/reports, to
-# benchmarks/artifacts/archive/ first; the reports are then replaced.
+# benchmarks/artifacts/archive/ first; the reports are then replaced. REPORT=0
+# stops after the test suites and leaves the reports alone, for machines that
+# cannot render them (reporting/generate.sh needs Chrome and Node.js).
 
 set -eu -o pipefail
 
@@ -25,11 +33,14 @@ if [ $# -ne 1 ]; then
     exit 2
 fi
 GEOLITE=$1
+HERE=$(cd "$(dirname "$0")" && pwd)
+if [ ! -f "$GEOLITE" ] && [ "${GEOLITE#/}" = "$GEOLITE" ] && [ -f "$HERE/$GEOLITE" ]; then
+    GEOLITE=$HERE/$GEOLITE
+fi
 if [ ! -f "$GEOLITE" ]; then
     echo "$GEOLITE: no such file" >&2
     exit 2
 fi
-HERE=$(cd "$(dirname "$0")" && pwd)
 # One run at a time: a second one would archive the campaign under way.
 mkdir -p "$HERE/artifacts"
 exec 9>"$HERE/artifacts/.reproduce.lock"
@@ -50,6 +61,9 @@ elapsed() {
 }
 STEP=0
 STEPS=9
+if [ "${REPORT:-1}" = 0 ]; then
+    STEPS=8
+fi
 step() {
     STEP=$((STEP + 1))
     printf '\n[%s] Step %d/%d: %s\n' "$(elapsed)" "$STEP" "$STEPS" "$*"
@@ -84,7 +98,9 @@ print((files.get("data/GeoLite2-City.mmdb") or {}).get("sha256", ""))' "$WORK/ra
     ARCHIVE=$HERE/artifacts/archive/$(basename "$WORK")-$(date -u +%Y%m%dT%H%M%SZ)
     mkdir -p "$ARCHIVE"
     mv "$WORK" "$ARCHIVE/campaign"
-    cp -a "$HERE/reports" "$ARCHIVE/reports"
+    if [ -d "$HERE/reports" ]; then
+        cp -a "$HERE/reports" "$ARCHIVE/reports"
+    fi
     log "Previous campaign and reports moved to $ARCHIVE"
 fi
 
@@ -121,9 +137,9 @@ step "Latency (timed)"
 "${RUN[@]}" latency "${TIMED[@]}" "${LATENCY[@]}"
 
 # The harness built above has --no-prepare, so the attribution campaign uses the
-# same executables.
+# same executables. It runs one worker and one per physical core.
 step "Attribution: packed traversal alone vs automatic preparation (timed)"
-"${RUN[@]}" attribution "${TIMED[@]}" --databases city --threads 1 8
+"${RUN[@]}" attribution "${TIMED[@]}" --databases city
 python3 "$HERE/campaign/environment.py" "$WORK" >"$WORK/raw/environment-end.json"
 
 step "Test suites"
@@ -131,6 +147,12 @@ step "Test suites"
 # Only the test suites need the extracted snapshots and build trees;
 # harness/build.sh recreates them.
 rm -rf "$WORK/build" "$WORK/src/before" "$WORK/src/after"
+
+if [ "${REPORT:-1}" = 0 ]; then
+    printf '\n[%s] Done in %s. Results: %s; reporting/generate.sh turns them into reports.\n' \
+        "$(elapsed)" "$(elapsed)" "$WORK"
+    exit 0
+fi
 
 step "Reports"
 "$HERE/reporting/generate.sh"

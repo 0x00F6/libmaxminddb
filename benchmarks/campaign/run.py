@@ -31,7 +31,6 @@ DATABASES = {
                   'label': 'Synthetic mixed'},
 }
 FAMILIES = (4, 6)
-THREADS = (1, 4, 8)
 SIZES = (10_000_000,)
 PROFILES = ('random', 'hits')
 OPERATIONS = ('lookup', 'decode')
@@ -59,6 +58,12 @@ def default_jobs(cpus):
         if line.startswith('MemAvailable:'):
             return max(1, min(len(cpus), int(line.split()[1]) // (768 * 1024)))
     return 1
+
+
+def default_threads(cpus):
+    """1, half and all of the physical cores, at most 8: 1, 4 and 8 workers on 8 or more cores."""
+    cores = min(8, len(cpus))
+    return sorted({1, max(1, cores // 2), cores})
 
 
 def preferred_cpus():
@@ -163,6 +168,9 @@ class Runner:
         self.raw.mkdir(parents=True, exist_ok=True)
         self.cpus = args.cpus or preferred_cpus()
         self.jobs = args.jobs or default_jobs(self.cpus)
+        self.threads = args.threads or default_threads(self.cpus)
+        # The attribution campaign compares one worker with every core.
+        self.attribution_threads = args.threads or sorted({1, max(self.threads)})
         self.log = open(self.raw / 'runner.log', 'a')
 
     def binary(self, version, alloc=False):
@@ -208,7 +216,7 @@ class Runner:
                    for operation in self.args.operations
                    for family in self.args.families
                    for queries in self.args.sizes
-                   for threads in self.args.threads]
+                   for threads in self.threads]
         campaign_start = time.monotonic()
         for index, (db, profile, operation, family, queries, threads) in enumerate(configs):
             key = (db, campaign, profile, operation, family, queries, threads)
@@ -339,7 +347,7 @@ class Runner:
                 for db in self.args.databases
                 for family in self.args.families
                 for queries in self.args.sizes
-                for threads in self.args.threads
+                for threads in self.threads
                 for iteration in range(self.args.memory_iterations)
                 for version in (VERSIONS if iteration % 2 == 0 else tuple(reversed(VERSIONS)))
                 if (db, family, queries, threads, iteration, version) not in done]
@@ -429,7 +437,7 @@ class Runner:
         configs = [(db, profile, family, queries, threads)
                    for db in self.args.databases for profile in self.args.profiles
                    for family in self.args.families for queries in self.args.sizes
-                   for threads in self.args.threads]
+                   for threads in self.attribution_threads]
         campaign_start = time.monotonic()
         for index, (db, profile, family, queries, threads) in enumerate(configs):
             key = (db, 'attribution', profile, 'lookup', family, queries, threads)
@@ -527,7 +535,9 @@ def main():
     parser.add_argument('--output', default=str(DEFAULT_WORK / 'raw'))
     parser.add_argument('--databases', nargs='+', default=list(DATABASES), choices=list(DATABASES))
     parser.add_argument('--families', nargs='+', type=int, default=list(FAMILIES))
-    parser.add_argument('--threads', nargs='+', type=int, default=list(THREADS))
+    parser.add_argument('--threads', nargs='+', type=int,
+                        help='worker counts (default: 1, half and all of the physical cores, at most 8; '
+                             'attribution: 1 and the largest)')
     parser.add_argument('--sizes', nargs='+', type=int, default=list(SIZES))
     parser.add_argument('--profiles', nargs='+', default=list(PROFILES), choices=list(PROFILES))
     parser.add_argument('--operations', nargs='+', default=list(OPERATIONS), choices=list(OPERATIONS))
@@ -547,7 +557,7 @@ def main():
     runner = Runner(args)
     monitor = HostMonitor(runner.raw / 'host-activity.jsonl')
     monitor.start()
-    runner.log.write(f'{utc_now()} start campaigns={args.campaigns} cpus={runner.cpus} argv={sys.argv}\n')
+    runner.log.write(f'{utc_now()} start campaigns={args.campaigns} cpus={runner.cpus} threads={runner.threads} argv={sys.argv}\n')
     try:
         for campaign in args.campaigns:
             if campaign in ('throughput', 'latency'):

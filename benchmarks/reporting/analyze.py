@@ -23,7 +23,7 @@ import random
 import shutil
 import statistics
 import subprocess
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -462,13 +462,20 @@ def host_summary(path):
 
 
 def timer_granularity(rows):
-    """Share of sampled latencies on a 10 ns grid (allowing the +1 ns rounding)."""
-    total = on_grid = 0
+    """Clock step seen in the sampled latencies: the coarsest grid of 3 to 200 ns
+    (allowing the +1 ns rounding) that holds at least 95% of them, or None when
+    the clock is finer. The measurement CPU's clock advances in about 10 ns steps."""
+    histogram = Counter()
     for row in rows:
         for value, count in row.get('latency_histogram_ns', []):
-            total += count
-            on_grid += count if value % 10 in (0, 1) else 0
-    return {'observations': total, 'on_10ns_grid_fraction': on_grid / total if total else None}
+            histogram[value] += count
+    total = sum(histogram.values())
+
+    def on_grid(step):
+        return sum(count for value, count in histogram.items() if value % step in (0, 1)) / total
+
+    step = next((s for s in range(200, 2, -1) if on_grid(s) >= 0.95), None) if total else None
+    return {'observations': total, 'step_ns': step, 'on_grid_fraction': on_grid(step) if step else None}
 
 
 def geomean(values):
@@ -605,6 +612,9 @@ def main():
     work_items = workloads(headers, verify_rows)
 
     environment = json.loads((raw / 'environment-start.json').read_text())
+    # validate.sh writes tests.json into the campaign; older campaigns wrote it into the data directory.
+    tests_path = next((p for p in (raw / 'tests.json', data / 'tests.json') if p.exists()), None)
+    tests = json.loads(tests_path.read_text()) if tests_path else None
     end = raw / 'environment-end.json'
     provenance = work / 'provenance'
     summary = {
@@ -638,7 +648,7 @@ def main():
             'timer_ns_all': sorted({json.dumps(h['timer_ns'], sort_keys=True) for h in headers}),
             'timer_granularity': timer_granularity(latency_rows),
         },
-        'tests': json.loads((data / 'tests.json').read_text()) if (data / 'tests.json').exists() else None,
+        'tests': tests,
         'throughput': throughput,
         'latency': latency,
         'memory': memory,
@@ -700,6 +710,20 @@ def main():
     (data / 'workloads.json').write_text(json.dumps(work_items, indent=1) + '\n')
     if (raw / 'host-activity.jsonl').exists():
         shutil.copy(raw / 'host-activity.jsonl', data / 'host-activity.jsonl')
+    if tests_path and tests_path != data / 'tests.json':
+        shutil.copy(tests_path, data / 'tests.json')
+    readme = (Path(__file__).resolve().parent / 'data-README.md').read_text()
+    (data / 'README.md').write_text(readme.replace('{measured_runs}', f'{summary["validation"]["measured_runs"]:,}'))
+    # Provenance of this campaign only; the Before/After diff and the CMake
+    # compile databases stay in the campaign (git and summary.json hold them).
+    shutil.rmtree(data / 'provenance', ignore_errors=True)
+    (data / 'provenance').mkdir()
+    for path in sorted(provenance.glob('*')):
+        if path.is_file() and path.name != 'before-after.diff' and not path.name.startswith('compile_commands-'):
+            shutil.copy(path, data / 'provenance' / path.name)
+    for name in ('environment-start.json', 'environment-end.json'):
+        if (raw / name).exists():
+            shutil.copy(raw / name, data / 'provenance' / name)
     sums = [f'{sha256(p)}  {p.relative_to(data)}' for p in sorted(data.rglob('*'))
             if p.is_file() and p.name != 'SHA256SUMS']
     (data / 'SHA256SUMS').write_text('\n'.join(sums) + '\n')

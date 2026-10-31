@@ -1,0 +1,171 @@
+name: Benchmarks
+
+# Measure Before/After on x86-64 and AArch64 runners with benchmarks/reproduce.sh,
+# then publish one report per architecture, with its figures and data, to
+# GitHub Pages. Runs for every push to a benchmarks/* branch.
+
+on:
+  push:
+    branches: ["benchmarks/**"]
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Complete matrix (both databases and profiles, 10 repetitions); several hours"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  database:
+    name: Pick the GeoLite2-City release
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      url: ${{ steps.release.outputs.url }}
+      sha256: ${{ steps.release.outputs.sha256 }}
+    steps:
+      # Both architectures download the same file, even if the mirror
+      # publishes a new release while the first job runs.
+      - name: Resolve the latest release of the mirror
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIRROR: P3TERX/GeoLite.mmdb
+        run: |
+          gh api "repos/$MIRROR/releases/latest" --jq '
+            .assets[] | select(.name == "GeoLite2-City.mmdb")
+            | "url=\(.browser_download_url)\nsha256=\((.digest // "") | ltrimstr("sha256:"))"' \
+            >>"$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  measure:
+    name: Measure on ${{ matrix.arch }}
+    needs: database
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # build.sh archives Before and After from the history and copies the
+          # pinned submodules.
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake build-essential clang cmake libssl-dev libtool \
+            ninja-build pkg-config
+
+      # Into benchmarks/, which git ignores for this file.
+      - name: Download GeoLite2-City
+        env:
+          URL: ${{ needs.database.outputs.url }}
+          SHA256: ${{ needs.database.outputs.sha256 }}
+        run: |
+          curl -fsSL --retry 3 -o benchmarks/GeoLite2-City.mmdb "$URL"
+          if [ -n "$SHA256" ]; then
+            echo "$SHA256  benchmarks/GeoLite2-City.mmdb" | sha256sum -c -
+          fi
+
+      - name: Measure Before and After
+        env:
+          FULL: ${{ inputs.full && '1' || '0' }}
+          # The reports are generated for every architecture in the next job.
+          REPORT: "0"
+        run: benchmarks/reproduce.sh GeoLite2-City.mmdb
+
+      # GeoLite2-City is left out: the reports only need its hash and metadata.
+      - name: Upload the campaign
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: campaign-${{ matrix.arch }}
+          path: |
+            benchmarks/artifacts/campaign
+            !benchmarks/artifacts/campaign/data/GeoLite2-City.mmdb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the logs of a failed campaign
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failed-campaign-${{ matrix.arch }}
+          path: |
+            benchmarks/artifacts/campaign/logs
+            benchmarks/artifacts/campaign/raw
+          if-no-files-found: ignore
+          retention-days: 7
+
+  report:
+    name: Reports and Pages site
+    needs: [database, measure]
+    # Publish the architectures that succeeded, even if another one failed.
+    if: ${{ !cancelled() && needs.database.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # check_consistency.py verifies the Before/After commit chain.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Download the campaigns
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: campaign-*
+          path: ${{ runner.temp }}/campaigns
+
+      - name: Generate and check the reports
+        env:
+          DATABASE_SOURCE: ${{ needs.database.outputs.url }}
+        run: |
+          # Ubuntu 24.04 keeps Chrome's sandbox from creating user namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          benchmarks/reporting/pages.sh "$RUNNER_TEMP/campaigns" "$RUNNER_TEMP/site"
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: report
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

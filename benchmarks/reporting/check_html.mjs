@@ -1,19 +1,29 @@
 // Exercise the interactive HTML report in headless Chrome through the DevTools
 // protocol: filters, thread highlighting, tooltips, keyboard focus,
 // table sorting and console errors. Screenshots are written for visual review.
-// Usage: node check_html.mjs REPORT.html OUTPUT_DIRECTORY
+// Usage: node check_html.mjs REPORT.html OUTPUT_DIRECTORY [SUMMARY.json]
+// SUMMARY.json defaults to performance-comparison-data/summary.json next to the
+// report; for a merged report, give the summary of its first architecture.
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const [report, outDir] = process.argv.slice(2);
+const [report, outDir, summaryPath] = process.argv.slice(2);
 if (!report || !outDir) {
-  console.error('Usage: node check_html.mjs REPORT.html OUTPUT_DIRECTORY');
+  console.error('Usage: node check_html.mjs REPORT.html OUTPUT_DIRECTORY [SUMMARY.json]');
   process.exit(2);
 }
 mkdirSync(outDir, { recursive: true });
+// The expected CPU, workload size and worker counts come from the data the report was generated from.
+const summary = JSON.parse(readFileSync(summaryPath ||
+  join(dirname(resolve(report)), 'performance-comparison-data', 'summary.json'), 'utf8'));
+const cpu = summary.environment.cpu.model;
+const queries = summary.throughput[0].queries;
+const size = queries % 1000000 === 0 ? `${queries / 1000000}M` : `${queries / 1000}K`;
+const threads = [...new Set(summary.throughput.map((c) => c.threads))].sort((a, b) => a - b);
+const highlight = String(threads[Math.min(1, threads.length - 1)]);
 const port = 9300 + Math.floor(Math.random() * 500);
 const profile = mkdtempSync(join(tmpdir(), 'report-check-'));
 const chrome = spawn(process.env.CHROME || 'google-chrome', [
@@ -83,17 +93,37 @@ await sleep(300);
 const visible = `[...document.querySelectorAll('[data-panel]')].filter(p => !p.hidden && p.querySelector('h3')).map(p => p.querySelector('h3').textContent)`;
 const initial = await evaluate(visible);
 check('initial panels visible', initial.length > 0, initial.join(' | '));
-check('10M throughput panels lead', initial[0]?.includes('Throughput') && initial[0]?.includes('(10M)'), initial[0]);
-check('required IPv4 10M title', initial.includes('IPv4 Throughput — Random Lookups (10M)'));
-check('required IPv6 10M title', initial.includes('IPv6 Throughput — Random Lookups (10M)'));
+check(`${size} throughput panels lead`, initial[0]?.includes('Throughput') && initial[0]?.includes(`(${size})`), initial[0]);
+check(`required IPv4 ${size} title`, initial.includes(`IPv4 Throughput — Random Lookups (${size})`));
+check(`required IPv6 ${size} title`, initial.includes(`IPv6 Throughput — Random Lookups (${size})`));
 check('no 1M panels', !initial.some((t) => t.includes('(1M)')), initial.filter((t) => t.includes('(1M)')).join(' | '));
 check('candlestick IPv4 visible', initial.some((t) => t.startsWith('Candlestick Percentile Rank — IPv4 Lookups')));
 check('candlestick IPv6 visible', initial.some((t) => t.startsWith('Candlestick Percentile Rank — IPv6 Lookups')));
 const title = await evaluate('document.title');
-check('CPU model in <title>', title.includes('AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics'), title);
+check('CPU model in <title>', title.includes(cpu), title);
 const h1 = await evaluate(`document.querySelector('h1').textContent`);
-check('CPU model in main header', h1.includes('AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics'), h1);
+check('CPU model in main header', h1.includes(cpu), h1);
 await screenshot('01-top');
+
+// Merged report: the Architecture filter shows one architecture at a time.
+const arches = await evaluate(`[...document.querySelectorAll('[data-control="arch"] button')].map(b => b.dataset.value)`);
+if (arches.length > 1) {
+  const shown = `[...new Set([...document.querySelectorAll('[data-arch]')].filter(e => !e.hidden).map(e => e.dataset.arch))]`;
+  check('one architecture shown at first', JSON.stringify(await evaluate(shown)) === JSON.stringify([arches[0]]));
+  const heading = `[...document.querySelectorAll('[data-arch]')].filter(e => !e.hidden).map(e => e.querySelector('h1')).find(Boolean).textContent`;
+  for (const value of arches.slice(1)) {
+    await evaluate(`document.querySelector('[data-control="arch"] button[data-value="${value}"]').click()`);
+    const visibleNow = await evaluate(shown);
+    const panels = await evaluate(visible);
+    const offered = await evaluate(`[...document.querySelectorAll('[data-arches]')].filter(b => !b.hidden).every(b => b.dataset.arches.split(' ').includes('${value}'))`);
+    check(`architecture switch to ${value}`, JSON.stringify(visibleNow) === JSON.stringify([value]) && panels.length > 0 && offered
+      && (await evaluate(heading)) !== h1, JSON.stringify(visibleNow));
+    check(`architecture ${value} kept in the URL`, (await evaluate('location.search')).includes(`arch=${value}`));
+    await screenshot(`01-top-${value}`);
+  }
+  await evaluate(`document.querySelector('[data-control="arch"] button[data-value="${arches[0]}"]').click()`);
+  check('architecture switch back', JSON.stringify(await evaluate(shown)) === JSON.stringify([arches[0]]));
+}
 await screenshot('02-throughput', '#throughput');
 
 const click = (control, value) => evaluate(
@@ -126,15 +156,15 @@ await screenshot('03-filtered', '#throughput');
 if (await has('profile', 'random')) await click('profile', 'random');
 if (await has('op', 'lookup')) await click('op', 'lookup');
 
-await click('threads', '4');
+await click('threads', highlight);
 const dims = await evaluate(`({dim: document.querySelectorAll('.dim').length, groups: document.querySelectorAll('[data-panel]:not([hidden]) g.group').length})`);
-check('thread highlight dims other groups', dims.dim > 0, JSON.stringify(dims));
-await screenshot('04-threads-4', '#throughput');
+check('thread highlight dims other groups', threads.length < 2 || dims.dim > 0, JSON.stringify(dims));
+await screenshot(`04-threads-${highlight}`, '#throughput');
 await click('threads', 'all');
 check('thread highlight resets', (await evaluate(`document.querySelectorAll('[data-panel]:not([hidden]) .dim').length`)) === 0);
 
 const candles = await evaluate(`[...document.querySelectorAll('[data-panel][data-chart="candlestick"]')].filter(p => !p.hidden).map(p => p.querySelector('h3').textContent)`);
-check('candlesticks show 10M queries', candles.length > 0 && candles.every((t) => t.includes('(10M)')), candles.join(' | '));
+check(`candlesticks show ${size} queries`, candles.length > 0 && candles.every((t) => t.includes(`(${size})`)), candles.join(' | '));
 await screenshot('05-candlestick', '#latency');
 
 await evaluate(`[...document.querySelectorAll('[data-panel]:not([hidden]) .mark[data-tip]')][0].scrollIntoView({block:'center', behavior:'instant'})`);

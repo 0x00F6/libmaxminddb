@@ -238,7 +238,7 @@ def badge(svg, x, y, speedup, low, high, change, size=16, kind='throughput'):
 
 
 def throughput_chart(meta, configs, title, subtitle, footer_lines):
-    """Grouped horizontal bars: Before/After at 1, 4 and 8 workers."""
+    """Grouped horizontal bars: Before/After at every worker count."""
     footer_lines = wrap_footer(footer_lines, 1100 - 64)
     standalone = meta['standalone']
     W, pad = 1100, 32
@@ -418,20 +418,22 @@ def scaling_chart(meta, panels, title, subtitle, footer_lines):
         svg.text(px, py + 4, panel['title'], 14.5, THEME['text'], weight=600)
         gx0, gx1 = px + 46, px + panel_w - 120
         gy0, gy1 = py + 22, py + panel_h - 40
-        ymax = max(8.0, max(p['scaling'][v]['scaling'] for p in panel['configs'] for v in ('before', 'after')) * 1.08)
+        counts = [c['threads'] for c in panel['configs']]
+        most = max(counts)
+        ymax = max(float(most), max(p['scaling'][v]['scaling'] for p in panel['configs'] for v in ('before', 'after')) * 1.08)
         ymax, ystep = nice_max(ymax, 4)
-        sx = lambda n: gx0 + (gx1 - gx0) * n / 8
+        sx = lambda n: gx0 + (gx1 - gx0) * n / most
         sy = lambda value: gy1 - (gy1 - gy0) * value / ymax
         value = 0.0
         while value <= ymax + 1e-9:
             svg.line(gx0, sy(value), gx1, sy(value), THEME['grid'])
             svg.text(gx0 - 8, sy(value) + 4, f'{value:g}×', 11.5, THEME['muted'], 'end', mono=True)
             value += ystep
-        for n in (1, 4, 8):
+        for n in counts:
             svg.text(sx(n), gy1 + 18, f'{n}', 12, THEME['muted'], 'middle', mono=True)
         svg.text((gx0 + gx1) / 2, gy1 + 36, 'Worker threads', 12, THEME['text2'], 'middle')
         svg.line(gx0, gy1, gx1, gy1, THEME['axis'])
-        svg.line(sx(1), sy(1), sx(8), sy(8), THEME['muted'], 1.5, ' stroke-opacity="0.7"')
+        svg.line(sx(1), sy(1), sx(most), sy(most), THEME['muted'], 1.5, ' stroke-opacity="0.7"')
         ends = []
         for version in ('before', 'after'):
             pts = [(sx(c['threads']), sy(c['scaling'][version]['scaling']), c) for c in panel['configs']]

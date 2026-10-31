@@ -12,9 +12,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORK = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / 'benchmarks/artifacts/campaign'
+# Relevant x86-64 flags and AArch64 features, as /proc/cpuinfo names them.
 FLAGS = ('sse4_2', 'avx', 'avx2', 'bmi1', 'bmi2', 'avx512f', 'avx512bw',
          'avx512vl', 'popcnt', 'lzcnt', 'abm', 'movbe', 'rdpru', 'constant_tsc',
-         'nonstop_tsc')
+         'nonstop_tsc',
+         'asimd', 'atomics', 'crc32', 'lrcpc', 'sve', 'sve2')
 
 
 def read(path, default=None):
@@ -37,6 +39,14 @@ def sha256(path):
         for block in iter(lambda: stream.read(1 << 20), b''):
             digest.update(block)
     return digest.hexdigest()
+
+
+def integer(value, default):
+    """lscpu prints "-" for some AArch64 fields, such as Socket(s)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def lscpu():
@@ -82,9 +92,31 @@ def cgroup():
             'memory.max': read(base / 'memory.max', 'not present')}
 
 
+def compiler_target():
+    """GCC's default target options: no -march flag is passed to either build."""
+    options = {}
+    for line in (command('gcc', '-Q', '--help=target') or '').splitlines():
+        match = re.match(r'\s+-m(arch|tune|cpu)=\s+(\S+)\s*$', line)
+        if match:
+            options.setdefault(match.group(1), match.group(2))
+    return {'machine': command('gcc', '-dumpmachine'), **options}
+
+
+def ci():
+    """The hosted runner, when GitHub Actions runs the campaign."""
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        return None
+    return {'service': 'GitHub Actions',
+            **{key.lower(): os.environ.get(key) for key in (
+                'RUNNER_ENVIRONMENT', 'RUNNER_ARCH', 'RUNNER_NAME', 'ImageOS', 'ImageVersion',
+                'GITHUB_REPOSITORY', 'GITHUB_REF_NAME', 'GITHUB_SHA', 'GITHUB_RUN_ID')}}
+
+
 def main():
     info = lscpu()
-    flags = set(read('/proc/cpuinfo', '').split('flags\t\t: ', 1)[1].split('\n', 1)[0].split())
+    # x86-64 lists "flags", AArch64 "Features".
+    match = re.search(r'^(?:flags|Features)\s*:\s*(.*)$', read('/proc/cpuinfo', ''), re.M)
+    flags = set(match.group(1).split()) if match else set()
     topology = cpu_topology()
     cores = {(c['package_id'], c['core_id']) for c in topology}
     environment = {
@@ -93,10 +125,10 @@ def main():
             'model': info.get('Model name'),
             'vendor': info.get('Vendor ID'),
             'family_model_stepping': f"{info.get('CPU family')}/{info.get('Model')}/{info.get('Stepping')}",
-            'sockets': int(info.get('Socket(s)', '1')),
+            'sockets': integer(info.get('Socket(s)'), 1),
             'physical_cores': len(cores),
-            'logical_cpus': int(info.get('CPU(s)', '0')),
-            'threads_per_core': int(info.get('Thread(s) per core', '1')),
+            'logical_cpus': integer(info.get('CPU(s)'), os.cpu_count()),
+            'threads_per_core': integer(info.get('Thread(s) per core'), 1),
             'available_to_benchmark': len(topology),
             'affinity': sorted(os.sched_getaffinity(0)),
             'smt_active': read('/sys/devices/system/cpu/smt/active'),
@@ -133,7 +165,9 @@ def main():
             'glibc': command('ldd', '--version').splitlines()[0],
             'python': platform.python_version(),
             'openssl': command('openssl', 'version'),
+            'gcc_target': compiler_target(),
         },
+        'ci': ci(),
         'files': {},
     }
     for path in sorted(WORK.glob('bin/bench-*')) + sorted(WORK.glob('build/*-release/libmaxminddb.a')) + sorted(WORK.glob('data/*.mmdb')):
