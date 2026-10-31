@@ -47,3 +47,8 @@ Testing/
 install_manifest.txt
 build/
 .lycheecache
+
+# Benchmark outputs: builds, measurements, databases and generated reports
+/benchmarks/artifacts/
+/benchmarks/reports/
+/benchmarks/**/__pycache__/
